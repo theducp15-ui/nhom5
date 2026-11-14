@@ -1,0 +1,155 @@
+GIẢI THÍCH BÀI THỰC HÀNH LẬP TRÌNH SOCKET TCP (C / WINSOCK)
+=============================================================
+
+1. TỔNG QUAN
+------------
+Bài thực hành có 3 file code, cổng dùng chung là 9000:
+
+  bai1server.c   Server của Bài 1: chat riêng giữa đúng 2 client.
+  bai2server.c  Server của Bài 2: phòng chat chung, tối đa 10 client.
+  Client.c   Client dùng chung cho cả hai bài.
+
+Mô hình client - server:
+  - Server là chương trình chờ sẵn ở một địa chỉ IP + cổng, nhận kết nối.
+  - Client chủ động kết nối tới server.
+  - Các client KHÔNG nói chuyện trực tiếp với nhau, mọi tin nhắn đều đi qua server.
+
+
+2. AI CHẠY CHƯƠNG TRÌNH NÀO?
+----------------------------
+  - Server: CHỈ MỘT máy chạy (máy có IP 26.39.140.134).
+            Bài 1 chạy bai1server.exe, Bài 2 chạy bai2server.exe.
+            Không chạy hai server cùng lúc vì cùng cổng 9000.
+  - Client: MỖI NGƯỜI muốn chat tự chạy Client.exe trên máy mình.
+            Bài 1 cần đúng 2 client.
+            Bài 2 cần từ 2 đến 10 client.
+  - Một người có thể mở nhiều cửa sổ client trên cùng máy để tự test.
+  - Bạn cùng nhóm không cần cài Visual Studio, chỉ cần file client.exe
+    (nằm trong thư mục Debug hoặc x64\Debug của project sau khi build).
+
+
+3. CÁCH CHẠY TỪNG BƯỚC
+----------------------
+Máy server:
+  1. Build và chạy bai1server.exe (hoặc bai2server.exe).
+  2. Thấy dòng "Server dang lang nghe o cong 9000" là server đã sẵn sàng.
+  3. Mở CMD quyền Administrator, mở firewall (làm một lần):
+       netsh advfirewall firewall add rule name="Cho phep Ping" protocol=icmpv4:8,any dir=in action=allow
+       netsh advfirewall firewall add rule name="TCP9000" dir=in action=allow protocol=TCP localport=9000
+  4. Nếu dùng Radmin VPN: mở Radmin VPN và để ở trạng thái online.
+
+Máy client:
+  1. Nếu dùng Radmin VPN: cài và vào cùng mạng với máy server.
+  2. Kiểm tra thấy server:  ping 26.39.140.134
+  3. Chạy client.exe, khi được hỏi IP thì gõ 26.39.140.134 rồi Enter.
+     (Chạy cùng máy với server thì chỉ cần nhấn Enter, mặc định 127.0.0.1.)
+  4. Thấy "Da ket noi toi server ..." là thành công.
+
+Thứ tự đúng: chạy server trước, sau đó mới chạy các client.
+
+Lưu ý về IP 26.x.x.x: đây thường là địa chỉ của Radmin VPN, nên các máy
+phải cùng vào một mạng Radmin thì mới thấy nhau. Máy Kali thường không
+vào được mạng này, hãy dùng client Windows.
+
+
+4. GIẢI THÍCH CODE
+------------------
+
+4.1. Phần code gốc (theo đề)
+  Server: WSAStartup -> socket -> bind (cổng 9000) -> listen.
+  Client: WSAStartup -> socket -> nhập IP -> connect.
+
+  - WSAStartup: khởi động thư viện Winsock, bắt buộc gọi một lần trên Windows.
+  - socket(AF_INET, SOCK_STREAM, IPPROTO_TCP): tạo socket TCP trên IPv4.
+  - bind: gắn socket vào cổng 9000 của máy. INADDR_ANY nghĩa là nhận kết nối
+    từ mọi card mạng của máy.
+  - listen: chuyển socket sang trạng thái lắng nghe.
+  - connect: client kết nối tới IP và cổng của server.
+  - htons: đổi số cổng sang thứ tự byte của mạng.
+
+4.2. tcp_server.c (Bài 1)
+  Câu a - chờ đủ hai client:
+    - accept lần 1 -> gửi "*** Dang cho nguoi thu hai...".
+    - accept lần 2 -> gửi "*** Bat dau chat." cho cả hai client.
+  Câu b - chuyển tin (hàm chat_loop):
+    - Dùng select() để chờ dữ liệu từ CẢ HAI socket cùng lúc.
+      Nếu dùng recv() thông thường, server sẽ bị kẹt ở một bên và không
+      nhận được tin của bên còn lại.
+    - Socket nào có dữ liệu thì recv() rồi send() sang socket kia.
+  Câu c - thoát / tắt ngang:
+    - recv() trả về 0 hoặc số âm: client đã đóng kết nối hoặc rớt mạng.
+    - Dòng nhận được là "/quit": client chủ động thoát.
+    - Cả hai trường hợp: gửi "*** Nguoi kia da roi cuoc tro chuyen" cho bên
+      còn lại rồi kết thúc phiên, server không bị lỗi.
+  Hàm send_all: send() có thể chỉ gửi được một phần dữ liệu, nên phải lặp
+  cho đến khi gửi đủ số byte.
+
+4.3. bai2_server.c (Bài 2)
+  - Mảng clients[10]: mỗi phần tử lưu socket, tên, trạng thái "đã nhập tên"
+    và bộ đệm ghép dòng. Ô trống có sock = INVALID_SOCKET.
+  - select() chờ cùng lúc: socket lắng nghe (có client mới) và tất cả
+    client đang kết nối (có tin nhắn hoặc ngắt kết nối).
+  - Client mới:
+      + Còn chỗ: gửi "Nhap ten cua ban: ".
+      + Hết chỗ (đã đủ 10): gửi "*** Phong da day" rồi ngắt kết nối.
+  - Dòng đầu tiên client gửi là TÊN. Tên không được trùng.
+    Sau đó server báo cả phòng "*** Ten vua vao phong".
+  - Tin nhắn thường được phát cho mọi người còn lại dưới dạng
+    "[Ten] noi dung" (người gửi không nhận lại tin của chính mình).
+  - Client gõ /quit hoặc tắt ngang: server xóa client khỏi mảng và báo cả
+    phòng "*** Ten da roi phong". Server vẫn chạy bình thường.
+  - Bộ đệm ghép dòng (feed_data): TCP là dòng byte, một lần recv() có thể
+    nhận nửa dòng hoặc nhiều dòng. Server gom byte lại và chỉ xử lý khi gặp
+    ký tự xuống dòng.
+
+4.4. tcp_client.c
+  - Luồng chính: đọc bàn phím bằng fgets rồi send() đi, mỗi tin là một dòng
+    kết thúc bằng '\n'.
+  - Luồng phụ (CreateThread): chỉ làm một việc là recv() liên tục và in ra
+    màn hình. Nhờ vậy client vừa gõ tin vừa nhận được tin của người khác
+    cùng lúc (câu b của Bài 1). Nếu chỉ có một luồng, fgets sẽ chặn và client
+    không thể nhận tin trong lúc chờ gõ.
+  - Gõ /quit: gửi lệnh cho server rồi thoát chương trình.
+  - Khi server đóng kết nối: luồng nhận in "*** Mat ket noi voi server." và
+    thoát.
+
+
+5. CÁC KHÁI NIỆM CẦN NHỚ
+------------------------
+  - TCP là giao thức hướng kết nối, tin cậy, truyền theo dòng byte (stream),
+    không giữ ranh giới giữa các tin nhắn.
+  - accept(): chặn cho đến khi có client kết nối, trả về socket mới dành cho
+    client đó. Socket lắng nghe vẫn tiếp tục nhận kết nối khác.
+  - select(): cho phép một luồng theo dõi nhiều socket, chỉ trả về khi có
+    ít nhất một socket sẵn sàng đọc.
+  - FD_ZERO, FD_SET, FD_ISSET: xóa tập socket, thêm socket vào tập, kiểm tra
+    socket nào đang sẵn sàng.
+  - shutdown(SD_SEND) trước closesocket: bảo đảm dữ liệu cuối cùng đã được
+    gửi đi trước khi đóng.
+
+
+6. CÁC LỖI THƯỜNG GẶP
+---------------------
+  Request timed out khi ping      Server chưa online (Radmin), hoặc firewall chặn.
+  Loi 10061 / Connection refused  Chương trình server chưa chạy hoặc sai IP.
+  Loi 10060 / timed out           Firewall chặn cổng 9000 hoặc chưa cùng mạng.
+  Loi bind() 10048                Cổng 9000 đang bị chương trình khác chiếm.
+                                  Tắt server cũ rồi chạy lại.
+  Dia chi IP khong hop le         Gõ sai IP hoặc thừa dấu cách.
+  Client thứ hai không vào được   Lần test trước đã có kết nối thử chiếm chỗ
+  (Bài 1)                         client thứ nhất. Tắt và chạy lại server.
+
+  Server Bài 1 chỉ phục vụ MỘT phiên rồi thoát. Muốn test lại thì chạy lại
+  server.
+
+
+7. GHI CHÚ KHI VIẾT BÁO CÁO
+---------------------------
+  - Phần code gốc: khởi tạo Winsock, socket, bind, listen (server);
+    khởi tạo Winsock, socket, nhập IP, connect (client).
+  - Phần nhóm tự bổ sung: accept, send, recv, select, CreateThread và toàn bộ
+    logic chuyển tin, xử lý thoát, quản lý danh sách client.
+  - Quy ước: cổng 9000, mỗi tin nhắn là một dòng văn bản, gõ tiếng Việt
+    không dấu.
+  - Dùng Wireshark lọc "tcp.port == 9000" để quan sát bắt tay 3 bước
+    (SYN, SYN-ACK, ACK), các gói chứa tin nhắn và các gói FIN khi thoát.
