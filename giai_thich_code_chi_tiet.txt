@@ -1,0 +1,495 @@
+GIẢI THÍCH CHI TIẾT TỪNG ĐOẠN CODE
+==================================
+
+Tên file sau khi bạn đổi:
+  bai1server.c       Server Bài 1: chat riêng 2 client
+  bai2server.c      Server Bài 2: phòng chat tối đa 10 client
+  client.c         Client dùng chung cho cả hai bài
+
+Quy ước đọc: mỗi mục ghi tên đoạn code, trích vài dòng chính rồi giải thích.
+Cổng dùng chung: 9000.
+
+
+=====================================================================
+PHẦN A. NHỮNG ĐOẠN GIỐNG NHAU Ở CẢ 3 FILE
+=====================================================================
+
+A1. Phần đầu file
+-----------------
+  #define _CRT_SECURE_NO_WARNINGS
+  #define WIN32_LEAN_AND_MEAN
+  #include <winsock2.h>
+  #include <ws2tcpip.h>
+  #include <stdio.h>
+  #include <string.h>
+  #pragma comment(lib, "Ws2_32.lib")
+  #define PORT 9000
+
+  - _CRT_SECURE_NO_WARNINGS: tắt cảnh báo của Visual Studio khi dùng các hàm
+    như strcpy, sprintf, fgets.
+  - WIN32_LEAN_AND_MEAN: không nạp bớt phần thừa của windows.h, tránh xung đột
+    giữa winsock.h cũ và winsock2.h.
+  - winsock2.h, ws2tcpip.h: khai báo các hàm socket (socket, bind, listen,
+    accept, send, recv, select...) và inet_pton.
+  - #pragma comment(lib, "Ws2_32.lib"): tự động liên kết thư viện Winsock,
+    không cần vào cài đặt project để thêm thư viện.
+  - PORT 9000: cổng theo quy ước của đề.
+
+A2. Hàm send_all
+----------------
+  static int send_all(SOCKET sock, const char* data, int length)
+  {
+      int total = 0;
+      while (total < length) {
+          int n = send(sock, data + total, length - total, 0);
+          if (n == SOCKET_ERROR || n == 0)
+              return 0;
+          total += n;
+      }
+      return 1;
+  }
+
+  - send() không đảm bảo gửi hết số byte yêu cầu, nó trả về số byte đã gửi
+    được thực tế (có thể ít hơn length).
+  - Biến total đếm số byte đã gửi. Vòng while lặp cho đến khi gửi đủ.
+  - data + total: dịch con trỏ tới phần chưa gửi.
+  - Trả về 1 nếu gửi đủ, 0 nếu lỗi (người nhận đã đóng kết nối, rớt mạng...).
+
+A3. Hàm send_text (có trong bai1server.c và bai2server.c)
+---------------------------------------------------------
+  static int send_text(SOCKET sock, const char* text)
+  {
+      return send_all(sock, text, (int)strlen(text));
+  }
+
+  - Chỉ là hàm rút gọn để gửi một chuỗi kết thúc bằng '\0' (các thông báo như
+    "*** Bat dau chat.\n").
+  - strlen đếm độ dài chuỗi rồi giao cho send_all gửi.
+
+A4. Bốn bước khởi tạo server (có trong bai1server.c và bai2server.c)
+--------------------------------------------------------------------
+  WSAStartup(MAKEWORD(2, 2), &wsa);
+  listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  addr.sin_family      = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_ANY);
+  addr.sin_port        = htons(PORT);
+  bind(listener, (struct sockaddr*)&addr, sizeof(addr));
+  listen(listener, SOMAXCONN);
+
+  - WSAStartup: khởi động Winsock phiên bản 2.2. Bắt buộc gọi một lần ở đầu
+    chương trình trên Windows. Trả về khác 0 là lỗi.
+  - socket(AF_INET, SOCK_STREAM, IPPROTO_TCP): tạo socket TCP trên IPv4.
+    AF_INET là IPv4, SOCK_STREAM là kiểu dòng byte (TCP).
+  - sockaddr_in addr: cấu trúc chứa địa chỉ server.
+      + INADDR_ANY: nhận kết nối từ mọi card mạng của máy (Wi-Fi, Ethernet,
+        Radmin...).
+      + htons / htonl: đổi số sang thứ tự byte của mạng (big-endian).
+  - bind: gắn socket vào địa chỉ và cổng ở trên. Lỗi 10048 nghĩa là cổng 9000
+    đang bị chương trình khác dùng.
+  - listen: chuyển socket sang trạng thái lắng nghe. SOMAXCONN là độ dài hàng
+    đợi kết nối tối đa mà hệ thống cho phép.
+  - Sau mỗi bước đều kiểm tra lỗi; nếu lỗi thì closesocket + WSACleanup rồi
+    thoát để không rò rỉ tài nguyên.
+
+
+=====================================================================
+PHẦN B. FILE bai1server.c (BÀI 1)
+=====================================================================
+
+B1. Các thông báo định nghĩa sẵn
+--------------------------------
+  #define MSG_WAITING "*** Dang cho nguoi thu hai...\n"
+  #define MSG_START   "*** Bat dau chat.\n"
+  #define MSG_LEFT    "*** Nguoi kia da roi cuoc tro chuyen\n"
+
+  - Ba chuỗi đúng nguyên văn đề yêu cầu. Định nghĩa một chỗ để dùng lại nhiều
+    lần, sửa một chỗ là đủ.
+
+B2. Hàm chat_loop: vòng lặp chuyển tin
+--------------------------------------
+  static void chat_loop(SOCKET c0, SOCKET c1)
+  {
+      SOCKET clients[2] = { c0, c1 };
+      fd_set readfds;
+      char buf[1024];
+
+  - Gom hai socket vào mảng clients[2] để dùng chỉ số i và 1 - i:
+    nếu nhận từ clients[i] thì gửi sang clients[1 - i] (i = 0 -> 1, i = 1 -> 0).
+  - fd_set readfds: tập các socket mà select() sẽ theo dõi.
+  - buf: bộ đệm nhận dữ liệu.
+
+  for (;;) {
+      FD_ZERO(&readfds);
+      FD_SET(clients[0], &readfds);
+      FD_SET(clients[1], &readfds);
+      if (select(0, &readfds, NULL, NULL, NULL) == SOCKET_ERROR) { ... return; }
+
+  - Mỗi vòng lặp phải dựng lại tập readfds vì select() sửa tập này khi trả về
+    (chỉ giữ lại các socket sẵn sàng).
+  - FD_ZERO xóa tập, FD_SET thêm từng socket vào tập.
+  - select(0, &readfds, NULL, NULL, NULL): chờ cho đến khi ít nhất một socket
+    có dữ liệu để đọc. Tham số đầu (0) bị Windows bỏ qua. Tham số cuối NULL
+    nghĩa là chờ vô hạn.
+  - Nhờ select, server theo dõi được CẢ HAI client cùng lúc. Nếu chỉ dùng
+    recv() cho client A thì server sẽ bị kẹt, không nhận được tin của B.
+
+  for (int i = 0; i < 2; i++) {
+      if (!FD_ISSET(clients[i], &readfds))
+          continue;
+
+  - FD_ISSET kiểm tra socket i có nằm trong số socket đang sẵn sàng không.
+    Nếu không thì bỏ qua và xét socket tiếp theo.
+
+  int n = recv(clients[i], buf, sizeof(buf), 0);
+  if (n <= 0) {
+      send_text(clients[1 - i], MSG_LEFT);
+      return;
+  }
+
+  - recv trả về số byte nhận được.
+  - n == 0: client đã đóng kết nối bình thường (ví dụ đóng cửa sổ).
+    n < 0: lỗi, thường là client bị tắt ngang hoặc rớt mạng.
+  - Cả hai trường hợp đều là "một bên đã rời": gửi MSG_LEFT cho bên còn lại
+    rồi return để kết thúc phiên (đáp ứng câu c của đề).
+
+  int len = n;
+  while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r'))
+      len--;
+  if (len == 5 && memcmp(buf, "/quit", 5) == 0) {
+      send_text(clients[1 - i], MSG_LEFT);
+      return;
+  }
+
+  - Client gửi lên một dòng kết thúc bằng '\n' (hoặc '\r\n'). Vòng while cắt
+    các ký tự xuống dòng ở cuối để lấy phần chữ thật.
+  - Nếu phần chữ đúng là "/quit" (5 ký tự) thì coi như client xin thoát:
+    báo cho bên kia rồi kết thúc.
+  - Lệnh /quit KHÔNG bị chuyển sang bên kia như một tin nhắn thường.
+
+  if (!send_all(clients[1 - i], buf, n)) {
+      send_text(clients[i], MSG_LEFT);
+      return;
+  }
+
+  - Tin nhắn thường: chuyển đúng n byte vừa nhận sang client còn lại
+    (dùng n byte, không dùng strlen, nên không bị lỗi nếu dữ liệu có byte 0).
+  - Nếu gửi thất bại, nghĩa là bên kia đã mất kết nối: báo ngược lại cho
+    người gửi.
+
+B3. Hàm main
+------------
+  Bước 1 - Khởi tạo (đã giải thích ở mục A4).
+
+  Bước 2 - Chờ client thứ nhất (câu a):
+    clients[0] = accept(listener, NULL, NULL);
+    send_text(clients[0], MSG_WAITING);
+    - accept chặn cho đến khi có client kết nối, trả về một socket MỚI dùng
+      riêng để nói chuyện với client đó. Socket listener vẫn dùng tiếp để
+      accept client sau.
+    - NULL, NULL: không cần biết địa chỉ của client.
+    - Gửi "*** Dang cho nguoi thu hai..." cho client đầu tiên.
+
+  Bước 3 - Chờ client thứ hai:
+    clients[1] = accept(listener, NULL, NULL);
+    for (int i = 0; i < 2; i++) send_text(clients[i], MSG_START);
+    - Khi đủ hai người, gửi "*** Bat dau chat." cho CẢ HAI.
+
+  Bước 4 - Chat:
+    chat_loop(clients[0], clients[1]);
+    - Giao hai socket cho chat_loop. Hàm chỉ trả về khi có một bên rời.
+
+  Bước 5 - Dọn dẹp:
+    shutdown(clients[0], SD_SEND);  shutdown(clients[1], SD_SEND);
+    closesocket(clients[0]); closesocket(clients[1]);
+    closesocket(listener);  WSACleanup();
+    - shutdown(SD_SEND) báo "tôi không gửi nữa" và đảm bảo thông báo cuối
+      (MSG_LEFT) tới được client trước khi đóng hẳn socket.
+    - closesocket đóng từng socket, WSACleanup giải phóng Winsock.
+    - Server Bài 1 chỉ phục vụ một phiên rồi thoát.
+
+
+=====================================================================
+PHẦN C. FILE bai2server.c (BÀI 2)
+=====================================================================
+
+C1. Các hằng số và cấu trúc dữ liệu
+-----------------------------------
+  #define MAX_CLIENTS 10
+  #define NAME_LEN    32
+  #define LINE_LEN    1024
+
+  typedef struct {
+      SOCKET sock;
+      char   name[NAME_LEN];
+      int    has_name;
+      char   buf[LINE_LEN];
+      int    len;
+  } Client;
+
+  static Client clients[MAX_CLIENTS];
+
+  - MAX_CLIENTS 10: tối đa 10 người trong phòng (câu a).
+  - Mỗi phần tử của mảng clients là một "ô" chứa thông tin một client:
+      + sock: socket của client. Giá trị INVALID_SOCKET nghĩa là ô đang trống.
+      + name: tên đã nhập (tối đa 31 ký tự).
+      + has_name: 0 = chưa nhập tên, 1 = đã nhập tên.
+      + buf, len: bộ đệm để ghép các mảnh dữ liệu thành một dòng hoàn chỉnh.
+  - clients là biến toàn cục để mọi hàm đều truy cập được.
+
+C2. Hàm broadcast: phát tin cho cả phòng
+----------------------------------------
+  static void broadcast(const char* text, int except)
+  {
+      for (int i = 0; i < MAX_CLIENTS; i++) {
+          if (i == except) continue;
+          if (clients[i].sock == INVALID_SOCKET || !clients[i].has_name) continue;
+          send_text(clients[i].sock, text);
+      }
+  }
+
+  - Duyệt toàn bộ mảng và gửi chuỗi text cho từng client.
+  - except: chỉ số client bị bỏ qua. Ví dụ khi Binh nhắn thì truyền chỉ số
+    của Binh để Binh không nhận lại tin của chính mình.
+    except = -1 nghĩa là gửi cho tất cả.
+  - Bỏ qua ô trống và client chưa nhập tên (chưa thật sự vào phòng).
+
+C3. Hàm remove_client: xóa client khỏi phòng
+--------------------------------------------
+  static void remove_client(int i)
+  {
+      int had_name = clients[i].has_name;
+      closesocket(clients[i].sock);
+      clients[i].sock = INVALID_SOCKET;
+      clients[i].has_name = 0;
+      clients[i].len = 0;
+      if (had_name) {
+          sprintf(msg, "*** %s da roi phong\n", clients[i].name);
+          broadcast(msg, -1);
+      }
+  }
+
+  - Đóng socket và đánh dấu ô trống (INVALID_SOCKET) để có thể dùng lại cho
+    client khác.
+  - Lưu had_name trước khi xóa để biết client này đã vào phòng thật chưa.
+    Nếu có tên mới báo "*** Ten da roi phong" cho cả phòng. Client chưa nhập
+    tên mà thoát thì không cần báo.
+  - Khi broadcast, socket của client này đã là INVALID_SOCKET nên sẽ không bị
+    gửi nhầm cho chính nó.
+  - Hàm này dùng cho cả hai trường hợp: gõ /quit và tắt ngang (câu c).
+
+C4. Hàm name_in_use: kiểm tra trùng tên
+---------------------------------------
+  - Duyệt mảng, nếu có client còn kết nối, đã có tên và strcmp trả về 0
+    (giống hệt) thì trả về 1. Dùng để từ chối tên đã có người dùng.
+
+C5. Hàm handle_line: xử lý MỘT dòng hoàn chỉnh
+----------------------------------------------
+  Trả về 0 nếu client cần bị xóa, trả về 1 nếu bình thường.
+
+  (1) if (strcmp(line, "/quit") == 0) return 0;
+      - Gõ /quit ở bất kỳ lúc nào cũng thoát (kể cả đang nhập tên).
+
+  (2) if (!c->has_name) { ... }   (client chưa có tên)
+      - Dòng rỗng: gửi lại "Nhap ten cua ban: ".
+      - Tên đã tồn tại: báo "*** Ten da co nguoi dung. Nhap ten khac: ".
+      - Hợp lệ: strncpy tên vào c->name, đặt has_name = 1, gửi lời chào riêng
+        cho client đó, rồi broadcast "*** Ten vua vao phong" cho những người
+        khác (except = i).
+
+  (3) Client đã có tên:
+      - Dòng rỗng thì bỏ qua.
+      - Còn lại: tạo chuỗi "[Ten] noi dung\n" bằng sprintf và broadcast cho
+        mọi người trừ người gửi.
+      - Đây chính là định dạng đề yêu cầu: [Ten] noi dung.
+
+C6. Hàm feed_data: ghép byte thành từng dòng
+--------------------------------------------
+  Vấn đề: TCP là dòng byte, không giữ ranh giới tin nhắn. Một lần recv()
+  có thể nhận nửa dòng, đúng một dòng hoặc nhiều dòng dính nhau. Vì vậy server
+  phải tự ghép lại.
+
+  for (int k = 0; k < n; k++) {
+      char ch = data[k];
+      if (ch != '\n' && c->len < LINE_LEN - 1) {
+          c->buf[c->len++] = ch;
+          continue;
+      }
+      ... xử lý dòng ...
+  }
+
+  - Đi qua từng byte vừa nhận. Chưa gặp '\n' thì cất vào c->buf của client đó.
+  - Khi gặp '\n' (hết một dòng): cắt các ký tự '\r' ở cuối, đặt '\0' kết thúc
+    chuỗi, reset len = 0 rồi gọi handle_line.
+  - Nếu handle_line trả về 0 thì gọi remove_client và dừng.
+  - Trường hợp dòng dài quá bộ đệm (không có '\n'): server vẫn xử lý phần đã
+    có để không bị tràn bộ nhớ, rồi giữ lại ký tự hiện tại cho dòng kế tiếp.
+  - Mỗi client có bộ đệm riêng (buf, len nằm trong struct) nên dữ liệu của
+    các client không bị lẫn vào nhau.
+
+C7. Hàm main: vòng lặp chính
+----------------------------
+  Khởi tạo: đặt mọi ô trong clients thành trống, rồi làm các bước ở mục A4.
+
+  for (;;) {
+      FD_ZERO(&readfds);
+      FD_SET(listener, &readfds);
+      for (...) if (clients[i].sock != INVALID_SOCKET) FD_SET(clients[i].sock, &readfds);
+      select(0, &readfds, NULL, NULL, NULL);
+
+  - Mỗi vòng, dựng tập readfds gồm: socket listener (để biết có client mới)
+    và tất cả socket client đang kết nối (để biết ai gửi tin hoặc ngắt kết nối).
+  - select chờ cho đến khi có ít nhất một socket sẵn sàng. Nhờ đó MỘT luồng
+    duy nhất phục vụ được cả 10 client, không cần tạo luồng cho từng client.
+
+  (1) Có client mới:
+      if (FD_ISSET(listener, &readfds)) {
+          SOCKET s = accept(listener, NULL, NULL);
+          tìm ô trống đầu tiên (slot);
+          if (slot < 0) { gửi "*** Phong da day\n"; shutdown; closesocket; }
+          else { lưu socket vào clients[slot]; gửi "Nhap ten cua ban: "; }
+      }
+      - Socket listener "sẵn sàng đọc" nghĩa là có kết nối đang chờ accept.
+      - Hết chỗ (đủ 10 người): gửi thông báo rồi ngắt kết nối ngay (câu a).
+      - Còn chỗ: đặt client vào ô trống, yêu cầu nhập tên (câu b).
+
+  (2) Có client gửi dữ liệu hoặc ngắt kết nối:
+      for (int i...) {
+          if (ô trống) continue;
+          if (!FD_ISSET(clients[i].sock, &readfds)) continue;
+          int n = recv(clients[i].sock, buf, sizeof(buf), 0);
+          if (n <= 0) { remove_client(i); continue; }
+          feed_data(i, buf, n);
+      }
+      - n <= 0: client tắt ngang hoặc đóng kết nối, gọi remove_client.
+        Server chỉ xóa client đó và tiếp tục chạy (câu c).
+      - n > 0: đưa dữ liệu cho feed_data để ghép dòng và xử lý.
+
+  Cuối chương trình (khi select lỗi): đóng tất cả socket còn lại, closesocket
+  listener và WSACleanup.
+
+
+=====================================================================
+PHẦN D. FILE client.c (DÙNG CHUNG BÀI 1 VÀ BÀI 2)
+=====================================================================
+
+D1. Biến toàn cục
+-----------------
+  static SOCKET g_sock = INVALID_SOCKET;
+  static volatile int g_quitting = 0;
+
+  - g_sock: socket kết nối tới server. Để toàn cục vì CẢ HAI luồng (luồng
+    chính gửi, luồng phụ nhận) đều dùng.
+  - g_quitting: cờ cho biết người dùng chủ động thoát. volatile báo trình
+    biên dịch rằng biến này có thể bị luồng khác thay đổi, không được tối ưu
+    bỏ qua.
+
+D2. Hàm send_all
+----------------
+  Giống mục A2.
+
+D3. Hàm recv_thread: luồng nhận tin
+-----------------------------------
+  static DWORD WINAPI recv_thread(LPVOID param)
+  {
+      char buf[1024];
+      int n;
+      for (;;) {
+          n = recv(g_sock, buf, sizeof(buf), 0);
+          if (n <= 0) break;
+          fwrite(buf, 1, (size_t)n, stdout);
+          fflush(stdout);
+      }
+      if (!g_quitting) {
+          printf("\n*** Mat ket noi voi server.\n");
+          exit(0);
+      }
+      return 0;
+  }
+
+  - Chữ ký DWORD WINAPI ... (LPVOID param) là dạng bắt buộc của hàm chạy
+    trong luồng do CreateThread tạo ra.
+  - Vòng for lặp mãi: recv chặn cho đến khi server gửi gì đó, rồi in ra màn
+    hình bằng fwrite (in đúng n byte), fflush để hiện ngay lập tức.
+  - n <= 0: server đóng kết nối hoặc rớt mạng, thoát vòng lặp.
+  - Nếu không phải do người dùng chủ động thoát (g_quitting = 0) thì in
+    "*** Mat ket noi voi server." và kết thúc chương trình bằng exit(0).
+  - Vì luồng này chỉ làm việc nhận, client vừa gõ phím vừa nhận được tin của
+    người khác cùng lúc (câu b của Bài 1).
+
+D4. Hàm main
+------------
+  Bước 1 - Khởi động Winsock và nhập IP:
+    printf("Nhap IP server (Enter = 127.0.0.1): ");
+    fgets(ip, sizeof(ip), stdin);
+    ip[strcspn(ip, "\r\n")] = '\0';
+    if (ip[0] == '\0') strcpy(ip, "127.0.0.1");
+    - fgets đọc cả ký tự xuống dòng nên phải cắt đi: strcspn tìm vị trí '\r'
+      hoặc '\n' đầu tiên, gán '\0' vào đó.
+    - Nhấn Enter không nhập gì thì mặc định 127.0.0.1 (server cùng máy).
+
+  Bước 2 - Tạo socket và địa chỉ server:
+    g_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    addr.sin_family = AF_INET;
+    addr.sin_port   = htons(PORT);
+    inet_pton(AF_INET, ip, &addr.sin_addr);
+    - inet_pton đổi chuỗi IP dạng chữ ("26.39.140.134") sang dạng số 32 bit.
+      Trả về khác 1 nghĩa là IP gõ sai.
+
+  Bước 3 - Kết nối:
+    connect(g_sock, (struct sockaddr*)&addr, sizeof(addr));
+    - Thực hiện bắt tay 3 bước với server. Thành công thì in
+      "Da ket noi toi server ...". Lỗi 10061 = server chưa chạy;
+      lỗi 10060 = bị firewall chặn hoặc không cùng mạng.
+
+  Bước 4 - Tạo luồng nhận tin:
+    hThread = CreateThread(NULL, 0, recv_thread, NULL, 0, NULL);
+    CloseHandle(hThread);
+    - CreateThread chạy hàm recv_thread song song với luồng chính.
+    - CloseHandle không dừng luồng, chỉ giải phóng "tay cầm" vì mình không
+      cần theo dõi luồng này nữa.
+
+  Bước 5 - Luồng chính: đọc bàn phím và gửi
+    while (fgets(line, 1024, stdin) != NULL) {
+        trim \r \n ở cuối -> độ dài t;
+        line[t] = '\n';  line[t + 1] = '\0';
+        send_all(g_sock, line, t + 1);
+        if (t == 5 && strncmp(line, "/quit", 5) == 0) break;
+    }
+    - fgets chặn cho đến khi người dùng gõ xong một dòng và nhấn Enter.
+    - Chuẩn hóa dòng: bỏ ký tự xuống dòng cũ rồi thêm đúng một '\n'. Mỗi tin
+      nhắn là một dòng kết thúc bằng '\n' (đúng quy ước của đề, và server
+      Bài 2 dựa vào '\n' để tách dòng).
+    - line khai báo 1030 byte, đọc tối đa 1024, nên thêm '\n' và '\0' không
+      bao giờ tràn bộ nhớ.
+    - Gõ /quit: vẫn gửi lệnh lên server để server biết, rồi thoát vòng lặp.
+
+  Bước 6 - Kết thúc:
+    g_quitting = 1;
+    shutdown(g_sock, SD_SEND);
+    Sleep(200);
+    closesocket(g_sock);
+    WSACleanup();
+    - Đặt g_quitting = 1 để luồng nhận không in thông báo "mất kết nối".
+    - shutdown + Sleep(200): chờ 0,2 giây để dữ liệu cuối ("/quit") kịp gửi đi
+      trước khi đóng socket.
+
+
+=====================================================================
+PHẦN E. LUỒNG HOẠT ĐỘNG MẪU
+=====================================================================
+
+Bài 1 (bai1server.c + client.c):
+  1. Chạy bai1server.exe -> "Server dang lang nghe o cong 9000".
+  2. Client A chạy client.c, connect -> server accept lần 1, gửi MSG_WAITING.
+  3. Client B connect -> server accept lần 2, gửi MSG_START cho cả A và B.
+  4. A gõ "xin chao" -> client A send() -> server select() thấy socket A sẵn
+     sàng -> recv() -> send_all() sang B -> luồng nhận của B in ra màn hình.
+  5. A gõ "/quit" -> server nhận ra lệnh, gửi MSG_LEFT cho B, đóng phiên.
+
+Bài 2 (bai2server.c + client.c):
+  1. Chạy bai2server.exe. Các client lần lượt connect, được hỏi tên.
+  2. An vào trước, Binh vào sau -> An thấy "*** Binh vua vao phong".
+  3. Binh gõ "chao ca nha" -> An (và các người khác) thấy "[Binh] chao ca nha".
+  4. Chi gõ /quit hoặc tắt cửa sổ -> server remove_client, mọi người thấy
+     "*** Chi da roi phong", server vẫn chạy.
+  5. Client thứ 11 connect -> nhận "*** Phong da day" rồi bị ngắt.
